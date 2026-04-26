@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --bg: #0A0F1E; --card: rgba(255,255,255,0.05); --border: rgba(255,255,255,0.08); }
+
+* { box-sizing: border-box; }
+html, body { background: var(--bg); color: #E2E8F0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif; }
+
+.glass { background: var(--card); border: 1px solid var(--border); backdrop-filter: blur(12px); border-radius: 12px; }
+.glow { box-shadow: 0 0 20px rgba(99,102,241,0.3); }
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.4); border-radius: 2px; }
