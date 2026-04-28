@@ -70,9 +70,23 @@ export default function VerifyEmailPage() {
       let attempts = pending.attempts || 0;
       if (attempts >= 3) { setError('Too many attempts. Please request a new code.'); setLoading(false); return; }
       
-      if (entered !== pending.code) {
-        attempts++;
-        localStorage.setItem('pending_verification', JSON.stringify({ ...pending, attempts }));
+      // Verify via server (supports both dev mode and prod HMAC tokens)
+    const verifyRes = await fetch('/api/verify-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code: entered,
+        token: pending.token,
+        email: pending.email,
+        expires: pending.expires,
+      }),
+    })
+    const verifyData = await verifyRes.json()
+    if (!verifyRes.ok || !verifyData.success) {
+      setError(verifyData.error || 'Invalid verification code')
+      setPending((p: any) => ({ ...p, attempts: (p.attempts || 0) + 1 }))
+      return
+    }));
         setError('Incorrect code. ' + (3 - attempts) + ' attempts remaining.');
         setLoading(false);
         return;

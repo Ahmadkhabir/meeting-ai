@@ -1,92 +1,264 @@
 'use client'
-import { useState, useRef, useEffect } from 'react'
-import { Mic, MicOff, Square, Pause, Play } from 'lucide-react'
 
-export default function Recording() {
-  const [status, setStatus] = useState<'idle'|'recording'|'paused'|'processing'>('idle')
+import { useState, useRef, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+
+type RecordingStatus = 'idle' | 'recording' | 'processing'
+
+export default function RecordingPage() {
+  const [status, setStatus] = useState<RecordingStatus>('idle')
   const [time, setTime] = useState(0)
-  const intervalRef = useRef<ReturnType<typeof setInterval>|null>(null)
-  const mediaRef = useRef<MediaRecorder|null>(null)
+  const [processingStep, setProcessingStep] = useState('')
+  const [error, setError] = useState('')
+
+  const mediaRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const durationRef = useRef(0)
+  const router = useRouter()
 
   useEffect(() => {
-    if (status === 'recording') {
-      intervalRef.current = setInterval(() => setTime(t => t+1), 1000)
-    } else {
-      if (intervalRef.current) clearInterval(intervalRef.current)
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current)
     }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
-  }, [status])
-
-  const fmt = (s:number) => `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`
+  }, [])
 
   async function start() {
+    setError('')
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({audio:true})
-      const mr = new MediaRecorder(stream)
-      mediaRef.current = mr
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       chunksRef.current = []
-      mr.ondataavailable = e => chunksRef.current.push(e.data)
+      durationRef.current = 0
+
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : 'audio/ogg'
+
+      const mr = new MediaRecorder(stream, { mimeType })
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data)
+      }
+      mr.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: mimeType })
+        processRecording(blob, durationRef.current)
+      }
       mr.start(1000)
+      mediaRef.current = mr
       setStatus('recording')
-      setTime(0)
-    } catch { alert('Microphone access denied') }
+
+      timerRef.current = setInterval(() => {
+        setTime((t) => {
+          durationRef.current = t + 1
+          return t + 1
+        })
+      }, 1000)
+    } catch (e: any) {
+      setError(
+        e.name === 'NotAllowedError'
+          ? 'Microphone permission denied. Please allow microphone access and try again.'
+          : 'Could not access microphone: ' + e.message
+      )
+    }
   }
 
-  function pause() {
-    if (mediaRef.current?.state === 'recording') { mediaRef.current.pause(); setStatus('paused') }
-    else if (mediaRef.current?.state === 'paused') { mediaRef.current.resume(); setStatus('recording') }
-  }
-
-  async function stop() {
-    if (!mediaRef.current) return
-    setStatus('processing')
+  function stop() {
+    if (!mediaRef.current || mediaRef.current.state === 'inactive') return
     mediaRef.current.stop()
-    mediaRef.current.stream.getTracks().forEach(t=>t.stop())
-    setTimeout(() => {
-      alert('Recording saved! In production this would transcribe and generate AI summary.')
+    mediaRef.current.stream.getTracks().forEach((t) => t.stop())
+    if (timerRef.current) clearInterval(timerRef.current)
+    setStatus('processing')
+  }
+
+  async function processRecording(blob: Blob, duration: number) {
+    try {
+      // Read API keys from localStorage (set in Settings page)
+      const keys = JSON.parse(localStorage.getItem('ai_keys') || '{}')
+      const models = JSON.parse(localStorage.getItem('ai_models') || '{}')
+
+      const openaiKey: string = keys.openai || ''
+      const groqKey: string = keys.groq || ''
+      const anthropicKey: string = keys.anthropic || ''
+
+      // Pick transcription provider (prefer OpenAI, fallback to Groq)
+      const transcribeProvider = openaiKey ? 'openai' : groqKey ? 'groq' : ''
+      const transcribeKey = openaiKey || groqKey || ''
+
+      if (!transcribeKey) {
+        setError(
+          'No API key found. Please add an OpenAI or Groq API key in Settings to enable transcription.'
+        )
+        setStatus('idle')
+        setTime(0)
+        return
+      }
+
+      // ── Step 1: Transcribe ──────────────────────────────────────────────
+      setProcessingStep('Transcribing audio...')
+      const formData = new FormData()
+      formData.append('audio', blob, 'recording.webm')
+      formData.append('provider', transcribeProvider)
+      formData.append('apiKey', transcribeKey)
+
+      const transcribeRes = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData,
+      })
+      const transcribeData = await transcribeRes.json()
+
+      if (!transcribeRes.ok || !transcribeData.text) {
+        setError(
+          transcribeData.error ||
+            'Transcription failed. Please check your API key in Settings and try again.'
+        )
+        setStatus('idle')
+        setTime(0)
+        return
+      }
+
+      const transcript: string = transcribeData.text
+
+      // ── Step 2: Summarize (best-effort) ────────────────────────────────
+      let summary = ''
+      let actionItems: string[] = []
+
+      const summaryKey = anthropicKey || openaiKey
+      const summaryProvider = anthropicKey ? 'anthropic' : 'openai'
+      const summaryModel = anthropicKey
+        ? models.anthropic || 'claude-3-haiku-20240307'
+        : models.openai || 'gpt-4o-mini'
+
+      if (summaryKey) {
+        setProcessingStep('Generating summary...')
+        try {
+          const summaryRes = await fetch('/api/summarize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              transcript,
+              provider: summaryProvider,
+              apiKey: summaryKey,
+              model: summaryModel,
+            }),
+          })
+          if (summaryRes.ok) {
+            const sd = await summaryRes.json()
+            summary = sd.summary || ''
+            actionItems = sd.actionItems || []
+          }
+        } catch {
+          // summary is best-effort — continue without it
+        }
+      }
+
+      // ── Step 3: Save meeting to localStorage ───────────────────────────
+      setProcessingStep('Saving meeting...')
+
+      const titleLine = summary
+        ? summary.split('\n').find((l) => l.trim()) || 'Meeting'
+        : 'Meeting'
+      const title =
+        titleLine.replace(/^[#*\s-]+/, '').slice(0, 60) ||
+        `Meeting on ${new Date().toLocaleDateString()}`
+
+      const meeting = {
+        id: Date.now().toString(),
+        title,
+        date: new Date().toISOString(),
+        duration: formatDuration(duration),
+        transcript,
+        summary,
+        actionItems,
+      }
+
+      const existing: any[] = JSON.parse(localStorage.getItem('meetings') || '[]')
+      existing.unshift(meeting)
+      localStorage.setItem('meetings', JSON.stringify(existing))
+
+      router.push('/meetings')
+    } catch (e: any) {
+      console.error('processRecording error:', e)
+      setError('Processing failed: ' + e.message)
       setStatus('idle')
       setTime(0)
-    }, 2000)
+    }
   }
 
-  const bars = Array.from({length:20},(_,i)=>i)
+  function formatDuration(seconds: number): string {
+    const m = Math.floor(seconds / 60)
+    const s = seconds % 60
+    return `${m}:${s.toString().padStart(2, '0')}`
+  }
+
+  const mins = String(Math.floor(time / 60)).padStart(2, '0')
+  const secs = String(time % 60).padStart(2, '0')
 
   return (
-    <div style={{maxWidth:'800px',margin:'0 auto',textAlign:'center'}}>
-      <h1 style={{fontSize:'28px',fontWeight:'700',color:'#F1F5F9',marginBottom:'8px'}}>Record Meeting</h1>
-      <p style={{color:'rgba(255,255,255,0.5)',marginBottom:'48px'}}>AI will transcribe and generate insights automatically</p>
+    <div className="min-h-screen bg-gray-950 text-white flex flex-col items-center justify-center p-8 gap-8">
+      <h1 className="text-3xl font-bold">Record Meeting</h1>
 
-      <div style={{position:'relative',display:'inline-flex',alignItems:'center',justifyContent:'center',marginBottom:'48px'}}>
-        {status==='recording' && (
-          <>
-            {[1,2,3].map(i=>(
-              <div key={i} style={{position:'absolute',width:`${120+i*60}px`,height:`${120+i*60}px`,borderRadius:'50%',border:'1px solid rgba(99,102,241,0.3)',animation:`ping ${1+i*0.5}s ease-out infinite`,opacity:0.4}} />
-            ))}
-          </>
-        )}
-        <button onClick={status==='idle'?start:stop} style={{width:'120px',height:'120px',borderRadius:'50%',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',background:status==='idle'?'linear-gradient(135deg,#6366F1,#8B5CF6)':status==='processing'?'rgba(99,102,241,0.5)':'linear-gradient(135deg,#EF4444,#DC2626)',boxShadow:status==='recording'?'0 0 40px rgba(99,102,241,0.6)':'none',transition:'all 0.3s',fontSize:'40px',color:'#fff'}}>
-          {status==='idle' ? <Mic size={40}/> : status==='processing' ? '...' : <Square size={36}/>}
-        </button>
+      {/* Timer */}
+      <div className="text-7xl font-mono tracking-wider text-white">
+        {mins}:{secs}
       </div>
 
-      {status!=='idle' && (
-        <div style={{marginBottom:'32px'}}>
-          <div style={{fontSize:'48px',fontWeight:'700',fontVariantNumeric:'tabular-nums',color:status==='paused'?'#EAB308':'#F1F5F9',marginBottom:'16px'}}>{fmt(time)}</div>
-          <div style={{display:'flex',alignItems:'flex-end',justifyContent:'center',gap:'3px',height:'40px',marginBottom:'20px'}}>
-            {bars.map(i=>(
-              <div key={i} style={{width:'4px',borderRadius:'2px',background:status==='recording'?'#6366F1':'rgba(99,102,241,0.3)',height:`${status==='recording'?Math.random()*100:20}%`,transition:'height 0.1s',minHeight:'4px'}} />
-            ))}
-          </div>
-          <button onClick={pause} style={{padding:'10px 24px',borderRadius:'8px',background:'rgba(255,255,255,0.08)',border:'1px solid rgba(255,255,255,0.15)',color:'#F1F5F9',cursor:'pointer',display:'inline-flex',alignItems:'center',gap:'8px',fontSize:'14px'}}>
-            {status==='paused'?<><Play size={14}/>Resume</>:<><Pause size={14}/>Pause</>}
+      {/* Error */}
+      {error && (
+        <div className="max-w-md w-full p-4 bg-red-900/40 border border-red-500/60 rounded-xl text-red-200 text-sm text-center">
+          {error}
+          <button
+            onClick={() => setError('')}
+            className="mt-2 block mx-auto text-red-400 hover:text-red-200 underline text-xs"
+          >
+            Dismiss
           </button>
         </div>
       )}
 
-      <div className="glass" style={{padding:'20px',textAlign:'left'}}>
-        <p style={{fontSize:'13px',color:'rgba(255,255,255,0.5)',textAlign:'center'}}>{status==='idle'?'Click the microphone to start recording':status==='recording'?'Recording in progress — AI will process when you stop':status==='paused'?'Recording paused':'Processing your recording...'}</p>
-      </div>
+      {/* Controls */}
+      {status === 'idle' && (
+        <button
+          onClick={start}
+          className="px-10 py-4 bg-red-600 hover:bg-red-700 active:scale-95 rounded-full text-xl font-semibold transition-all"
+        >
+          Start Recording
+        </button>
+      )}
+
+      {status === 'recording' && (
+        <div className="flex flex-col items-center gap-5">
+          <div className="flex items-center gap-2 text-red-400 font-medium">
+            <span className="w-3 h-3 rounded-full bg-red-500 animate-pulse inline-block" />
+            Recording in progress
+          </div>
+          <button
+            onClick={stop}
+            className="px-10 py-4 bg-gray-700 hover:bg-gray-600 active:scale-95 rounded-full text-xl font-semibold transition-all"
+          >
+            Stop &amp; Transcribe
+          </button>
+        </div>
+      )}
+
+      {status === 'processing' && (
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+          <p className="text-gray-400 text-lg">{processingStep || 'Processing...'}</p>
+          <p className="text-gray-600 text-sm">This may take a moment</p>
+        </div>
+      )}
+
+      {/* Settings reminder */}
+      {status === 'idle' && (
+        <p className="text-gray-600 text-sm text-center max-w-xs">
+          Make sure you&apos;ve added your OpenAI or Groq API key in{' '}
+          <a href="/settings" className="text-indigo-400 hover:underline">
+            Settings
+          </a>{' '}
+          before recording.
+        </p>
+      )}
     </div>
   )
 }

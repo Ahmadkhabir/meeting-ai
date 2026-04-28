@@ -1,80 +1,84 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server'
+import { createHmac } from 'crypto'
 
-// Rate limit store (in-memory, resets on cold start)
-const rateLimit = new Map<string, { count: number; resetAt: number }>();
+function generateCode(): string {
+  return Math.floor(100000 + Math.random() * 900000).toString()
+}
 
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = rateLimit.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateLimit.set(ip, { count: 1, resetAt: now + 60_000 });
-    return false;
-  }
-  if (entry.count >= 5) return true;
-  entry.count++;
-  return false;
+function signCode(code: string, email: string, expires: number): string {
+  const secret =
+    process.env.NEXTAUTH_SECRET ||
+    process.env.OTP_SECRET ||
+    'meeting-ai-otp-fallback-secret'
+  return createHmac('sha256', secret)
+    .update(`${code}:${email.toLowerCase()}:${expires}`)
+    .digest('hex')
 }
 
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') || 'unknown';
-  if (isRateLimited(ip)) {
-    return NextResponse.json({ error: 'Too many requests. Please wait a minute.' }, { status: 429 });
-  }
+  try {
+    const { email, name } = await req.json()
 
-  const { email } = await req.json();
-  if (!email || !email.includes('@')) {
-    return NextResponse.json({ error: 'Invalid email address' }, { status: 400 });
-  }
-
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-  const expires = Date.now() + 10 * 60 * 1000; // 10 minutes
-
-  const resendKey = process.env.RESEND_API_KEY;
-  const hasResend = resendKey && resendKey.length > 10;
-
-  if (hasResend) {
-    try {
-      const emailRes = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: 'MeetingAI <noreply@resend.dev>',
-          to: email,
-          subject: 'Your MeetingAI verification code',
-          html: `<!DOCTYPE html>
-<html>
-<body style="margin:0;padding:0;background:#0A0F1E;font-family:system-ui,sans-serif">
-  <div style="max-width:480px;margin:40px auto;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:40px">
-    <div style="text-align:center;margin-bottom:32px">
-      <div style="width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,#6366F1,#8B5CF6);margin:0 auto 16px;display:flex;align-items:center;justify-content:center;font-size:26px">🎙️</div>
-      <h1 style="color:#fff;font-size:24px;font-weight:700;margin:0">MeetingAI</h1>
-    </div>
-    <h2 style="color:#fff;font-size:20px;font-weight:600;margin:0 0 12px">Verify your email address</h2>
-    <p style="color:rgba(255,255,255,0.55);font-size:14px;line-height:1.6;margin:0 0 28px">Use the code below to complete your sign-up. It expires in 10 minutes.</p>
-    <div style="background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);border-radius:12px;padding:20px;text-align:center;margin-bottom:28px">
-      <p style="color:rgba(255,255,255,0.5);font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:1px">Verification Code</p>
-      <p style="color:#fff;font-size:40px;font-weight:800;letter-spacing:10px;margin:0">${code}</p>
-    </div>
-    <p style="color:rgba(255,255,255,0.35);font-size:13px;margin:0">If you didn't request this, you can safely ignore this email.</p>
-  </div>
-</body>
-</html>`
-        })
-      });
-
-      if (!emailRes.ok) {
-        const err = await emailRes.text();
-        console.error('Resend error:', err);
-        return NextResponse.json({ error: 'Failed to send email. Check RESEND_API_KEY.' }, { status: 500 });
-      }
-
-      return NextResponse.json({ success: true, expires, devMode: false });
-    } catch (err) {
-      console.error('Email send error:', err);
-      return NextResponse.json({ error: 'Email service error.' }, { status: 500 });
+    if (!email) {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 })
     }
-  }
 
-  // Dev mode: return code directly (no real email sent)
-  return NextResponse.json({ success: true, code, expires, devMode: true });
+    const code = generateCode()
+    const expires = Date.now() + 10 * 60 * 1000 // 10 minutes
+    const token = signCode(code, email, expires)
+
+    // Dev mode: no Resend key configured — return code directly for testing
+    if (!process.env.RESEND_API_KEY) {
+      return NextResponse.json({ success: true, code, expires, token, devMode: true })
+    }
+
+    // Production mode: send email via Resend
+    const { Resend } = await import('resend')
+    const resend = new Resend(process.env.RESEND_API_KEY)
+
+    const { error: resendError } = await resend.emails.send({
+      from: 'MeetingAI <onboarding@resend.dev>',
+      to: email,
+      subject: 'Your MeetingAI verification code',
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    max-width: 480px; margin: 0 auto; padding: 32px; background: #0f172a;
+                    color: #e2e8f0; border-radius: 12px;">
+          <h2 style="margin: 0 0 8px; font-size: 24px; color: #f8fafc;">
+            Welcome to MeetingAI${name ? `, ${name}` : ''}!
+          </h2>
+          <p style="color: #94a3b8; margin: 0 0 24px;">
+            Use the code below to verify your email address. It expires in 10 minutes.
+          </p>
+          <div style="background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+                      padding: 24px; text-align: center; margin-bottom: 24px;">
+            <span style="font-size: 40px; font-weight: 700; letter-spacing: 12px;
+                         color: #6366f1; font-family: monospace;">
+              ${code}
+            </span>
+          </div>
+          <p style="color: #64748b; font-size: 13px; margin: 0;">
+            If you didn't create a MeetingAI account, you can safely ignore this email.
+          </p>
+        </div>
+      `,
+    })
+
+    if (resendError) {
+      console.error('Resend error:', resendError)
+      return NextResponse.json(
+        { error: 'Failed to send verification email. Please try again.' },
+        { status: 500 }
+      )
+    }
+
+    // Production: return token but NOT the code — server verifies via /api/verify-code
+    return NextResponse.json({ success: true, expires, token, devMode: false })
+  } catch (err: any) {
+    console.error('send-verification error:', err)
+    return NextResponse.json(
+      { error: err.message || 'Internal server error' },
+      { status: 500 }
+    )
+  }
 }

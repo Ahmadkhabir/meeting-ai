@@ -131,7 +131,15 @@ export default function LoginPage() {
       const data = await res.json();
       if (!data.success) { setError(data.error || 'Failed to send verification email.'); setLoading(false); return; }
       // Store registration data temporarily
-      localStorage.setItem('pending_verification', JSON.stringify({ email, name, code: data.code, expires: data.expires, attempts: 0, devCode: data.devMode ? data.code : undefined }));
+      localStorage.setItem('pending_verification', JSON.stringify({
+          email,
+          name,
+          token: data.token,
+          expires: data.expires,
+          attempts: 0,
+          devMode: data.devMode,
+          devCode: data.devMode ? data.code : undefined,
+        }));
       localStorage.setItem('registered_' + email, JSON.stringify({ email, name, password: btoa(password), registeredAt: Date.now() }));
       router.push('/verify-email');
     } catch { setError('Sign up failed. Please try again.'); }
